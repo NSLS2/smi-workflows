@@ -10,6 +10,81 @@ import tqdm
 import shutil
 
 
+# Optional "best guess" aliases for known motor short-names.  These are only
+# consulted when the exact key is missing from the event data.  Add entries
+# here if/when you want a short name (e.g. "x") to resolve to a real signal
+# (e.g. "piezo_x").  Leaving this empty keeps behaviour purely literal.
+SAFE_KEY_ALIASES: dict[str, str] = {
+    # "x": "piezo_x",
+    # "y": "piezo_y",
+}
+
+
+class _SafeFormatPlaceholder:
+    """
+    Stand-in for a missing format key.
+
+    When formatted it reproduces the original ``{key}`` (preserving any
+    format spec, e.g. ``{N:06d}``) so unresolved placeholders are written
+    out literally instead of raising ``KeyError``.
+    """
+
+    def __init__(self, key: str):
+        self.key = key
+
+    def __format__(self, spec: str) -> str:
+        if spec:
+            return "{" + self.key + ":" + spec + "}"
+        return "{" + self.key + "}"
+
+    def __str__(self) -> str:
+        return "{" + self.key + "}"
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+    def __ascii__(self) -> str:
+        return self.__str__()
+
+
+class _SafeFormatDict(dict):
+    """A mapping for ``str.format_map`` that never raises on missing keys.
+
+    Missing keys are recorded in ``missing_keys`` (after trying the alias
+    table) and substituted with a literal ``{key}`` placeholder.
+    """
+
+    def __init__(self, *args, aliases=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.aliases = aliases or {}
+        self.missing_keys: set[str] = set()
+
+    def __missing__(self, key):
+        alias = self.aliases.get(key)
+        if alias is not None and alias in self:
+            return self[alias]
+        self.missing_keys.add(key)
+        return _SafeFormatPlaceholder(key)
+
+
+def _safe_format(template, mapping, *, logger=None):
+    """
+    ``str.format``-style substitution that leaves unresolved ``{name}``
+    placeholders in the output instead of raising ``KeyError``.
+
+    Returns the formatted string.  Any keys that could not be resolved are
+    logged as a warning (if a logger is provided).
+    """
+    safe = _SafeFormatDict(mapping, aliases=SAFE_KEY_ALIASES)
+    result = template.format_map(safe)
+    if safe.missing_keys and logger is not None:
+        logger.warning(
+            f"Unresolved name(s) {sorted(safe.missing_keys)} in template "
+            f"{template!r}; left literally in output: {result!r}"
+        )
+    return result
+
+
 @task
 def do_symlinking(
     links: list[tuple[str, Path, Path]],
@@ -188,12 +263,28 @@ def get_symlink_pairs(ref, *, det_map, root_map=None, api_key=None, dry_run=Fals
                         )
 
 
-                        dest_path = target_path / target_template.format(
-                            det_name=det_name,
-                            N=point_number * fpp + fr,
-                            det_type=det_type,
-                            **single_doc_data
-                        ).format(**single_doc_data)
+                        # Two passes so placeholders that only appear after
+                        # the first substitution (e.g. a sample_name written
+                        # as "{{x}}") still get resolved.  Both passes are
+                        # "safe": any name that cannot be resolved from the
+                        # event data is left literally in the filename
+                        # instead of raising KeyError and killing the flow.
+                        format_data = {
+                            "det_name": det_name,
+                            "N": point_number * fpp + fr,
+                            "det_type": det_type,
+                            **single_doc_data,
+                        }
+                        # Only the second pass warns: its input contains
+                        # every literal {key} the first pass left behind, so
+                        # its missing-key set is a superset of the first
+                        # pass's.  This avoids emitting duplicate warnings
+                        # for the same unresolved name.
+                        dest_name = _safe_format(target_template, format_data)
+                        dest_name = _safe_format(
+                            dest_name, format_data, logger=logger
+                        )
+                        dest_path = target_path / dest_name
 
                         links.append(
                             (start_uid, source_path, dest_path, analysis_path)
